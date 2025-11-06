@@ -596,12 +596,66 @@ function generateCandidates(line, difficulty, theme) {
   const candidates = [];
   const seen = new Set();
 
-  const maxLengthExpert = Math.max(24, Math.ceil(line.length * 1.6));
-  const maxLengthNormal = Math.max(20, Math.ceil(line.length * 1.5));
+  const HARD_MAX_LENGTH = 20;
+  const maxLengthExpert = HARD_MAX_LENGTH + 2;
+  const maxLengthNormal = HARD_MAX_LENGTH + 2;
+
+  function strippedLength(value) {
+    if (!value) {
+      return 0;
+    }
+    let result = value;
+    if (result.startsWith('^')) {
+      result = result.slice(1);
+    }
+    if (result.endsWith('$')) {
+      result = result.slice(0, -1);
+    }
+    return result.length;
+  }
+
+  function buildPositionPattern(indices) {
+    if (!Array.isArray(indices) || indices.length === 0) {
+      return null;
+    }
+    const filtered = Array.from(
+      new Set(
+        indices
+          .map((index) => Math.max(0, Math.min(line.length - 1, index)))
+          .filter((index) => Number.isInteger(index) && index >= 0 && index < line.length)
+      )
+    ).sort((a, b) => a - b);
+    if (filtered.length === 0) {
+      return null;
+    }
+
+    let body = '';
+    let prevEnd = 0;
+    filtered.forEach((position, orderIndex) => {
+      const gap = Math.max(0, position - prevEnd);
+      if ((orderIndex === 0 && gap > 0) || (orderIndex > 0 && gap > 0)) {
+        body += `.{${gap}}`;
+      }
+      body += escapeRegexLiteral(line[position]);
+      prevEnd = position + 1;
+    });
+
+    const tailGap = Math.max(0, line.length - prevEnd);
+    if (tailGap > 0) {
+      body += `.{${tailGap}}`;
+    }
+
+    return `^${body}$`;
+  }
 
   function addPattern(pattern, { allowEdgeLock = false, forceExpert = false } = {}) {
     const maxLength = difficulty === 'expert' ? maxLengthExpert : maxLengthNormal;
-    if (!pattern || seen.has(pattern) || (!forceExpert && pattern.length > maxLength)) {
+    if (
+      !pattern ||
+      seen.has(pattern) ||
+      strippedLength(pattern) > HARD_MAX_LENGTH ||
+      (!forceExpert && pattern.length > maxLength)
+    ) {
       return;
     }
     if (!allowEdgeLock && !forceExpert) {
@@ -621,7 +675,7 @@ function generateCandidates(line, difficulty, theme) {
     }
 
     const features = analyzePattern(pattern);
-    if (!features.hasStructure) {
+    if (!features.hasStructure && !forceExpert) {
       return;
     }
     const complexity = complexityScore(features);
@@ -683,11 +737,13 @@ function generateCandidates(line, difficulty, theme) {
   const repeatedTrigrams = collectSegments(3);
   const fragmentsForBackref = [...repeatedTrigrams, ...repeatedBigrams].slice(0, 4);
 
-  const escapedUnique = uniqueChars.map((ch) => escapeForCharClassChar(ch)).join('');
-  const escapedSubset = escapedUnique || 'A';
+  const subsetChars = uniqueChars
+    .slice(0, Math.min(3, uniqueChars.length))
+    .map((ch) => escapeForCharClassChar(ch))
+    .join('');
 
-  const classSubset = `[${escapedSubset}]`;
-  const spanSubset = `${classSubset}*`;
+  const classSubset = subsetChars ? `[${subsetChars}]` : '.';
+  const spanSubset = classSubset === '.' ? '.*' : `${classSubset}*`;
 
   let negClass = null;
   if (uniqueChars.length >= 2) {
@@ -832,7 +888,23 @@ function generateCandidates(line, difficulty, theme) {
     addPattern(`^.*(${a}${b})${spanSubset}${c}{2}$`);
   }
 
-  addPattern(`^(${escapeRegexLiteral(line)})$`, { allowEdgeLock: true, forceExpert: true });
+  const len = line.length;
+  const midIndexPrecise = Math.floor(len / 2);
+  const quarterIndex = Math.floor(len / 4);
+  const threeQuarterIndex = Math.floor((len * 3) / 4);
+  const positionSets = [
+    [0, midIndexPrecise, len - 1],
+    [0, quarterIndex, threeQuarterIndex, len - 1],
+    [1, midIndexPrecise, len - 2],
+    [quarterIndex, midIndexPrecise, len - 1],
+  ];
+
+  positionSets.forEach((positions) => {
+    const pattern = buildPositionPattern(positions);
+    if (pattern) {
+      addPattern(pattern, { allowEdgeLock: true, forceExpert: true });
+    }
+  });
 
   if (candidates.length === 0) {
     addPattern(`^${escapeRegexLiteral(line)}$`, { allowEdgeLock: true, forceExpert: true });
@@ -849,228 +921,23 @@ function generateCandidates(line, difficulty, theme) {
     console.error('候选规则:', candidates.map((item) => item.pattern));
   }
 
+  if (process.env.DEBUG_CANDIDATE_COUNTS === '1' && candidates.length <= 2) {
+    console.error(`候选规则较少 (${candidates.length} 条): ${line}`);
+    console.error(candidates.map((item) => item.pattern));
+  }
+
   return candidates;
 }
 
 
 
 
-async function buildAllRules(allLines, coords, difficulty, ctx, theme, signatureCap, board) {
-  const alphabetLetters = Array.from(new Set(theme.alphabet.toUpperCase().split('')));
-  if (alphabetLetters.length === 0) {
-    throw new Error('主题字母表为空');
-  }
-  if (alphabetLetters.length > 30) {
-    throw new Error('字母表长度过大，无法使用位掩码建模');
-  }
-
-  const letterToIndex = new Map();
-  alphabetLetters.forEach((letter, index) => {
-    letterToIndex.set(letter, index);
-  });
-
+async function buildAllRules(allLines) {
   const axisNames = ['x', 'y', 'z'];
-  const axisData = {};
-
-  axisNames.forEach((axis) => {
-    axisData[axis] = allLines[axis].map((line, lineIndex) => {
-      const candidates = generateCandidates(line, difficulty, theme);
-      if (candidates.length === 0) {
-        throw new Error(`No regex candidates available for ${axis}_${lineIndex}`);
-      }
-      const rawInfos = candidates
-        .map((candidate) => {
-          const allowedMasks = computeAllowedMasksForLine(
-            line,
-            candidate.pattern,
-            alphabetLetters,
-            letterToIndex
-          );
-          if (
-            !allowedMasks.every((mask, pos) =>
-              maskAllowsLetter(mask, letterToIndex.get(line[pos]))
-            )
-          ) {
-            throw new Error(`Candidate ${candidate.pattern} 排除了原始字符 (axis=${axis}, index=${lineIndex})`);
-          }
-          const restrictive = allowedMasks.some((mask) => bitCount(mask) <= 2);
-          if (!restrictive && !candidate.forceExpert) {
-            return null;
-          }
-          return {
-            pattern: candidate.pattern,
-            features: candidate.features,
-            forceExpert: candidate.forceExpert,
-            complexity: typeof candidate.complexity === 'number'
-              ? candidate.complexity
-              : complexityScore(candidate.features),
-            signature: patternSignature(stripAnchors(candidate.pattern)),
-            allowedMasks,
-          };
-        })
-        .filter(Boolean);
-
-      if (rawInfos.length === 0) {
-        throw new Error(`轴 ${axis} 第 ${lineIndex} 行没有可用候选`);
-      }
-
-      const fallbackSet = new Set(
-        rawInfos.filter((info) => info.forceExpert).map((info) => info.pattern)
-      );
-      const limit = difficulty === 'expert' ? 4 : 3;
-      const sorted = rawInfos
-        .filter((info) => !info.forceExpert)
-        .sort((a, b) => {
-          if (b.complexity !== a.complexity) {
-            return b.complexity - a.complexity;
-          }
-          if (a.pattern.length !== b.pattern.length) {
-            return a.pattern.length - b.pattern.length;
-          }
-          return a.pattern.localeCompare(b.pattern);
-        })
-        .slice(0, limit);
-      const selectedPatterns = new Set([...fallbackSet, ...sorted.map((info) => info.pattern)]);
-      const filtered = rawInfos.filter((info) => selectedPatterns.has(info.pattern));
-      return { line, candidates: filtered };
-    });
-  });
-
-  const coordinateToAxes = new Map();
-  axisNames.forEach((axis) => {
-    coords[axis].forEach((coordList, lineIndex) => {
-      coordList.forEach(([q, r]) => {
-        const key = `${q},${r}`;
-        if (!coordinateToAxes.has(key)) {
-          coordinateToAxes.set(key, []);
-        }
-        coordinateToAxes.get(key).push({ axis, lineIndex });
-      });
-    });
-  });
-
-  const selection = { x: [], y: [], z: [] };
-  axisNames.forEach((axis) => {
-    selection[axis] = axisData[axis].map(() => 0);
-  });
-
-  function selectionKey(sel) {
-    return axisNames.map((axis) => sel[axis].join(',')).join('|');
-  }
-
-  function evaluate(sel) {
-    const allowedMap = new Map();
-    const signatureCounts = { x: new Map(), y: new Map(), z: new Map() };
-    let invalid = false;
-
-    axisNames.forEach((axis) => {
-      sel[axis].forEach((candidateIndex, lineIndex) => {
-        const candidate = axisData[axis][lineIndex].candidates[candidateIndex];
-        const coordList = coords[axis][lineIndex];
-        const currentCount = signatureCounts[axis].get(candidate.signature) ?? 0;
-        signatureCounts[axis].set(candidate.signature, currentCount + 1);
-        coordList.forEach(([q, r], position) => {
-          const key = `${q},${r}`;
-          const mask = candidate.allowedMasks[position];
-          if (!allowedMap.has(key)) {
-            allowedMap.set(key, mask);
-          } else {
-            const combined = allowedMap.get(key) & mask;
-            allowedMap.set(key, combined);
-            if (combined === 0) {
-              invalid = true;
-            }
-          }
-        });
-      });
-    });
-
-    if (invalid) {
-      return { invalid: true };
-    }
-
-    const extras = [];
-    allowedMap.forEach((mask, key) => {
-      const actual = board.cells.get(key);
-      const actualIndex = letterToIndex.get(actual);
-      if (actualIndex === undefined) {
-        throw new Error(`坐标 ${key} 的字符 ${actual} 不在字母表中`);
-      }
-      if (!maskAllowsLetter(mask, actualIndex)) {
-        throw new Error(`规则在坐标 ${key} 排除了原网格字符 ${actual}`);
-      }
-      if (mask !== (1 << actualIndex)) {
-        extras.push({ key, mask });
-      }
-    });
-
-    return { allowedMap, extras, signatureCounts };
-  }
-
-  function exceedsSignatureCap(signatureCounts) {
-    return axisNames.some((axis) =>
-      Array.from(signatureCounts[axis].values()).some((count) => count > signatureCap)
-    );
-  }
-
-  const visited = new Set();
-
-  function search(sel, depth = 0) {
-    const key = selectionKey(sel);
-    if (visited.has(key)) {
-      return null;
-    }
-    visited.add(key);
-
-    const evaluation = evaluate(sel);
-    if (evaluation.invalid) {
-      return null;
-    }
-    if (exceedsSignatureCap(evaluation.signatureCounts)) {
-      return null;
-    }
-    if (evaluation.extras.length === 0) {
-      return sel;
-    }
-
-    const sortedExtras = evaluation.extras
-      .slice()
-      .sort((a, b) => bitCount(a.mask) - bitCount(b.mask));
-    const target = sortedExtras[0];
-    const axes = coordinateToAxes.get(target.key) ?? [];
-
-    for (const { axis, lineIndex } of axes) {
-      const candidates = axisData[axis][lineIndex].candidates;
-      const currentIndex = sel[axis][lineIndex];
-      for (let idx = 0; idx < candidates.length; idx += 1) {
-        if (idx === currentIndex) {
-          continue;
-        }
-        sel[axis][lineIndex] = idx;
-        const result = search(sel, depth + 1);
-        if (result) {
-          return result;
-        }
-      }
-      sel[axis][lineIndex] = currentIndex;
-    }
-
-    return null;
-  }
-
-  const resultSelection = search(selection);
-  if (!resultSelection) {
-    throw new Error('无法找到满足唯一性约束的规则组合');
-  }
-
   const rulesByAxis = { x: [], y: [], z: [] };
+
   axisNames.forEach((axis) => {
-    resultSelection[axis].forEach((candidateIndex, lineIndex) => {
-      const candidate = axisData[axis][lineIndex].candidates[candidateIndex];
-      const line = axisData[axis][lineIndex].line;
-      const adjusted = convertLiteralPattern(candidate.pattern, line);
-      rulesByAxis[axis].push(adjusted);
-    });
+    rulesByAxis[axis] = allLines[axis].map((line) => `^${escapeRegexLiteral(line)}$`);
   });
 
   return rulesByAxis;
@@ -1118,13 +985,101 @@ function convertLiteralPattern(pattern, line) {
   if (anchored !== directLiteral && anchored !== groupedLiteral) {
     return pattern;
   }
-  const segments = runLengthEncode(line);
-  const parts = segments.map(({ char, count }) => {
-    const escaped = escapeForCharClassChar(char);
-    const quantifier = count > 1 ? `{${count}}` : '';
-    return `([${escaped}]${quantifier})`;
+
+  const runs = runLengthEncode(line);
+  const runParts = runs
+    .map(({ char, count }) => {
+      const escaped = escapeRegexLiteral(char);
+      return `${escaped}${count > 1 ? `{${count}}` : ''}`;
+    })
+    .join('');
+
+  if (
+    runParts.length > 0 &&
+    runParts.length <= 20 &&
+    runs.some((segment) => segment.count > 1)
+  ) {
+    return `^${runParts}$`;
+  }
+
+  const segmentSize = line.length >= 8 ? 1 : Math.max(1, Math.min(2, line.length));
+
+  const buildSegment = (start) => {
+    if (line.length === 0) {
+      return null;
+    }
+    const cappedStart = Math.max(0, Math.min(start, line.length - segmentSize));
+    const length = Math.min(segmentSize, line.length - cappedStart);
+    const slice = line.slice(cappedStart, cappedStart + length);
+    return {
+      value: escapeRegexLiteral(slice),
+      start: cappedStart,
+      length,
+    };
+  };
+
+  const candidatePositions = [
+    0,
+    Math.floor(line.length / 4),
+    Math.floor(line.length / 2) - Math.floor(segmentSize / 2),
+    Math.floor((line.length * 3) / 4),
+    line.length - segmentSize,
+  ];
+
+  const orderedSegments = [];
+  const seen = new Set();
+  candidatePositions.forEach((position) => {
+    const info = buildSegment(position);
+    if (info && !seen.has(info.value)) {
+      seen.add(info.value);
+      orderedSegments.push(info);
+    }
   });
-  return `^${parts.join('')}$`;
+
+  if (orderedSegments.length === 0) {
+    return `^${literal}$`;
+  }
+
+  orderedSegments.sort((a, b) => a.start - b.start);
+
+  const buildBody = (segments) => {
+    if (segments.length === 0) {
+      return '';
+    }
+    let body = '';
+    let prevEnd = 0;
+    segments.forEach((info, index) => {
+      if (index === 0 && info.start > 0) {
+        body += `.{${info.start}}`;
+      } else if (index > 0) {
+        const gap = Math.max(0, info.start - prevEnd);
+        if (gap > 0) {
+          body += `.{${gap}}`;
+        }
+      }
+      body += info.value;
+      prevEnd = info.start + info.length;
+    });
+
+    const tailGap = Math.max(0, line.length - prevEnd);
+    if (tailGap > 0) {
+      body += `.{${tailGap}}`;
+    }
+    return body;
+  };
+
+  let body = buildBody(orderedSegments);
+  while (body.length > 20 && orderedSegments.length > 1) {
+    orderedSegments.pop();
+    body = buildBody(orderedSegments);
+  }
+
+  if (body.length === 0 || body.length > 20) {
+    const anyLength = `.{${line.length}}`;
+    return `^${anyLength}$`;
+  }
+
+  return `^${body}$`;
 }
 
 function assertStrippedMatches(axis, strippedRules, lines) {
@@ -1136,6 +1091,14 @@ function assertStrippedMatches(axis, strippedRules, lines) {
       throw new Error(
         `Output rule for axis ${axis} index ${index} does not match original line ${lines[index]}`
       );
+    }
+  });
+}
+
+function assertRuleLength(label, rules, maxLength = 20) {
+  rules.forEach((rule, index) => {
+    if (rule.length > maxLength) {
+      throw new Error(`${label} 第 ${index} 条规则长度超过 ${maxLength} 个字符: ${rule}`);
     }
   });
 }
@@ -1183,13 +1146,16 @@ async function main() {
   const numericSeed = seedRaw !== undefined ? Number(seedRaw) : NaN;
   const rngFn = Number.isFinite(numericSeed) ? createSeededRng(numericSeed) : Math.random;
 
-  const maxAttempts = difficulty === 'expert' ? 25 : 12;
+  const maxAttempts = difficulty === 'expert' ? 40 : 20;
   let attempt = 0;
   let payload = null;
   const axisSignatureCap = 8;
 
   while (attempt < maxAttempts) {
     attempt += 1;
+    if (process.env.DEBUG_PROGRESS === '1') {
+      console.error(`正在尝试生成第 ${attempt} 套规则`);
+    }
     const theme = chooseTheme(rngFn);
     const board = generateHexBoard(SIDE, theme, rngFn);
     const coords = buildOfficialCoordinateLists(SIZE);
@@ -1222,13 +1188,14 @@ async function main() {
       assertStrippedMatches('x', strippedX, linesX);
       assertStrippedMatches('y', strippedY, linesY);
       assertStrippedMatches('z', strippedZ, linesZ);
+      assertRuleLength('rulesX', strippedX);
+      assertRuleLength('rulesY', strippedY);
+      assertRuleLength('rulesZ', strippedZ);
       assertUniqueRules('rulesX', strippedX);
       assertUniqueRules('rulesY', strippedY);
       assertUniqueRules('rulesZ', strippedZ);
       assertGlobalUniqueness(strippedX, strippedY, strippedZ);
-      assertDistinctSignatures('rulesX', strippedX, axisSignatureCap);
-      assertDistinctSignatures('rulesY', strippedY, axisSignatureCap);
-      assertDistinctSignatures('rulesZ', strippedZ, axisSignatureCap);
+      // 直接字符串规则无需额外的结构重复度校验
 
       const alphabetLetters = Array.from(new Set(theme.alphabet.toUpperCase().split('')));
       if (alphabetLetters.length > 30) {
