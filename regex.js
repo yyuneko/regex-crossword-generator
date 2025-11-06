@@ -365,25 +365,61 @@ function patternSignature(pattern) {
   return signature.replace(/(.)\1+/g, '$1$1');
 }
 
-function computeAllowedLettersForLine(line, pattern, alphabet) {
+function computeAllowedMasksForLine(line, pattern, alphabet, letterToIndex) {
   const regex = new RegExp(pattern);
-  const allowed = [];
-  const letters = Array.from(new Set(alphabet));
+  const result = new Array(line.length);
+  const letters = Array.isArray(alphabet) ? alphabet : Array.from(new Set(alphabet));
+
   for (let pos = 0; pos < line.length; pos += 1) {
     const original = line[pos];
-    const set = new Set([original]);
-    letters.forEach((letter) => {
+    const originalIndex = letterToIndex.get(original);
+    if (originalIndex === undefined) {
+      throw new Error(`字母 ${original} 不在主题字母表内`);
+    }
+
+    let mask = 1 << originalIndex;
+    for (let index = 0; index < letters.length; index += 1) {
+      const letter = letters[index];
       if (letter === original) {
-        return;
+        continue;
       }
       const mutated = `${line.slice(0, pos)}${letter}${line.slice(pos + 1)}`;
       if (regex.test(mutated)) {
-        set.add(letter);
+        const bitIndex = letterToIndex.get(letter);
+        if (bitIndex === undefined) {
+          throw new Error(`字母 ${letter} 不在主题字母表内`);
+        }
+        mask |= 1 << bitIndex;
       }
-    });
-    allowed.push(set);
+    }
+    result[pos] = mask;
   }
-  return allowed;
+
+  return result;
+}
+
+function bitCount(mask) {
+  let count = 0;
+  let value = mask >>> 0;
+  while (value) {
+    value &= value - 1;
+    count += 1;
+  }
+  return count;
+}
+
+function maskAllowsLetter(mask, letterIndex) {
+  return (mask & (1 << letterIndex)) !== 0;
+}
+
+function maskToLetters(mask, indexToLetter) {
+  const letters = [];
+  for (let bit = 0; bit < indexToLetter.length; bit += 1) {
+    if ((mask & (1 << bit)) !== 0) {
+      letters.push(indexToLetter[bit]);
+    }
+  }
+  return letters;
 }
 
 function buildAlternationPattern(line, chunkSize) {
@@ -560,12 +596,66 @@ function generateCandidates(line, difficulty, theme) {
   const candidates = [];
   const seen = new Set();
 
-  const maxLengthExpert = Math.max(24, Math.ceil(line.length * 1.6));
-  const maxLengthNormal = Math.max(20, Math.ceil(line.length * 1.5));
+  const HARD_MAX_LENGTH = 20;
+  const maxLengthExpert = HARD_MAX_LENGTH + 2;
+  const maxLengthNormal = HARD_MAX_LENGTH + 2;
+
+  function strippedLength(value) {
+    if (!value) {
+      return 0;
+    }
+    let result = value;
+    if (result.startsWith('^')) {
+      result = result.slice(1);
+    }
+    if (result.endsWith('$')) {
+      result = result.slice(0, -1);
+    }
+    return result.length;
+  }
+
+  function buildPositionPattern(indices) {
+    if (!Array.isArray(indices) || indices.length === 0) {
+      return null;
+    }
+    const filtered = Array.from(
+      new Set(
+        indices
+          .map((index) => Math.max(0, Math.min(line.length - 1, index)))
+          .filter((index) => Number.isInteger(index) && index >= 0 && index < line.length)
+      )
+    ).sort((a, b) => a - b);
+    if (filtered.length === 0) {
+      return null;
+    }
+
+    let body = '';
+    let prevEnd = 0;
+    filtered.forEach((position, orderIndex) => {
+      const gap = Math.max(0, position - prevEnd);
+      if ((orderIndex === 0 && gap > 0) || (orderIndex > 0 && gap > 0)) {
+        body += `.{${gap}}`;
+      }
+      body += escapeRegexLiteral(line[position]);
+      prevEnd = position + 1;
+    });
+
+    const tailGap = Math.max(0, line.length - prevEnd);
+    if (tailGap > 0) {
+      body += `.{${tailGap}}`;
+    }
+
+    return `^${body}$`;
+  }
 
   function addPattern(pattern, { allowEdgeLock = false, forceExpert = false } = {}) {
     const maxLength = difficulty === 'expert' ? maxLengthExpert : maxLengthNormal;
-    if (!pattern || seen.has(pattern) || (!forceExpert && pattern.length > maxLength)) {
+    if (
+      !pattern ||
+      seen.has(pattern) ||
+      strippedLength(pattern) > HARD_MAX_LENGTH ||
+      (!forceExpert && pattern.length > maxLength)
+    ) {
       return;
     }
     if (!allowEdgeLock && !forceExpert) {
@@ -585,7 +675,7 @@ function generateCandidates(line, difficulty, theme) {
     }
 
     const features = analyzePattern(pattern);
-    if (!features.hasStructure) {
+    if (!features.hasStructure && !forceExpert) {
       return;
     }
     const complexity = complexityScore(features);
@@ -647,13 +737,23 @@ function generateCandidates(line, difficulty, theme) {
   const repeatedTrigrams = collectSegments(3);
   const fragmentsForBackref = [...repeatedTrigrams, ...repeatedBigrams].slice(0, 4);
 
-  const availableNegChars = themeAlphabet.filter((ch) => !uniqueChars.includes(ch));
-  const escapedUnique = uniqueChars.map((ch) => escapeForCharClassChar(ch)).join('');
-  const escapedSubset = escapedUnique || 'A';
+  const subsetChars = uniqueChars
+    .slice(0, Math.min(3, uniqueChars.length))
+    .map((ch) => escapeForCharClassChar(ch))
+    .join('');
 
-  const classSubset = `[${escapedSubset}]`;
-  const spanSubset = `${classSubset}*`;
-  const negClass = availableNegChars.length > 0 ? `[^${availableNegChars.map(escapeForCharClassChar).join('')}]` : null;
+  const classSubset = subsetChars ? `[${subsetChars}]` : '.';
+  const spanSubset = classSubset === '.' ? '.*' : `${classSubset}*`;
+
+  let negClass = null;
+  if (uniqueChars.length >= 2) {
+    const excludedForNeg = uniqueChars.slice(0, Math.min(2, uniqueChars.length - 1));
+    const allowedAfterExclude = themeAlphabet.filter((ch) => !excludedForNeg.includes(ch));
+    if (excludedForNeg.length > 0 && allowedAfterExclude.length > 0) {
+      const escapedExcluded = excludedForNeg.map((ch) => escapeForCharClassChar(ch)).join('');
+      negClass = `[^${escapedExcluded}]`;
+    }
+  }
   const negSpan = negClass ? `${negClass}*` : null;
 
   const headPair = line.slice(0, 2);
@@ -788,7 +888,23 @@ function generateCandidates(line, difficulty, theme) {
     addPattern(`^.*(${a}${b})${spanSubset}${c}{2}$`);
   }
 
-  addPattern(`^(${escapeRegexLiteral(line)})$`, { allowEdgeLock: true, forceExpert: true });
+  const len = line.length;
+  const midIndexPrecise = Math.floor(len / 2);
+  const quarterIndex = Math.floor(len / 4);
+  const threeQuarterIndex = Math.floor((len * 3) / 4);
+  const positionSets = [
+    [0, midIndexPrecise, len - 1],
+    [0, quarterIndex, threeQuarterIndex, len - 1],
+    [1, midIndexPrecise, len - 2],
+    [quarterIndex, midIndexPrecise, len - 1],
+  ];
+
+  positionSets.forEach((positions) => {
+    const pattern = buildPositionPattern(positions);
+    if (pattern) {
+      addPattern(pattern, { allowEdgeLock: true, forceExpert: true });
+    }
+  });
 
   if (candidates.length === 0) {
     addPattern(`^${escapeRegexLiteral(line)}$`, { allowEdgeLock: true, forceExpert: true });
@@ -805,213 +921,23 @@ function generateCandidates(line, difficulty, theme) {
     console.error('候选规则:', candidates.map((item) => item.pattern));
   }
 
+  if (process.env.DEBUG_CANDIDATE_COUNTS === '1' && candidates.length <= 2) {
+    console.error(`候选规则较少 (${candidates.length} 条): ${line}`);
+    console.error(candidates.map((item) => item.pattern));
+  }
+
   return candidates;
 }
 
 
-function orExpressions(ctx, exprs) {
-  if (exprs.length === 0) {
-    return ctx.Bool.val(false);
-  }
-  if (exprs.length === 1) {
-    return exprs[0];
-  }
-  return ctx.Or(...exprs);
-}
 
-async function buildAllRules(allLines, coords, difficulty, ctx, theme, signatureCap, board) {
-  const alphabetLetters = Array.from(new Set(theme.alphabet.toUpperCase().split('')));
-  if (alphabetLetters.length === 0) {
-    throw new Error('主题字母表为空');
-  }
 
+async function buildAllRules(allLines) {
   const axisNames = ['x', 'y', 'z'];
-  const axisData = {};
-
-  axisNames.forEach((axis) => {
-    axisData[axis] = allLines[axis].map((line, lineIndex) => {
-      const candidates = generateCandidates(line, difficulty, theme);
-      if (candidates.length === 0) {
-        throw new Error(`No regex candidates available for ${axis}_${lineIndex}`);
-      }
-      const candidateInfos = candidates.map((candidate, candidateIndex) => {
-        const boolVar = ctx.Bool.const(`${axis}_${lineIndex}_cand_${candidateIndex}`);
-        const allowed = computeAllowedLettersForLine(line, candidate.pattern, alphabetLetters);
-        if (!allowed.every((set, pos) => set.has(line[pos]))) {
-          throw new Error(`Candidate ${candidate.pattern} 排除了原始字符 (axis=${axis}, index=${lineIndex})`);
-        }
-        return {
-          pattern: candidate.pattern,
-          features: candidate.features,
-          forceExpert: candidate.forceExpert,
-          complexity: typeof candidate.complexity === 'number'
-            ? candidate.complexity
-            : complexityScore(candidate.features),
-          signature: patternSignature(stripAnchors(candidate.pattern)),
-          boolVar,
-          allowed,
-        };
-      });
-      return {
-        line,
-        coords: coords[axis][lineIndex],
-        candidates: candidateInfos,
-      };
-    });
-  });
-
-  const optimize = new ctx.Optimize();
-  if (typeof optimize.set === 'function') {
-    optimize.set('priority', 'lex');
-  }
-  const zero = ctx.Int.val(0);
-  const one = ctx.Int.val(1);
-  let totalLength = ctx.Int.val(0);
-  let totalComplexity = ctx.Int.val(0);
-
-  const signatureCounts = { x: new Map(), y: new Map(), z: new Map() };
-
-  axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData, lineIndex) => {
-      const selectVars = lineData.candidates.map((candidate) => candidate.boolVar);
-      let sumSelected = ctx.Int.val(0);
-      selectVars.forEach((boolVar) => {
-        sumSelected = sumSelected.add(ctx.If(boolVar, one, zero));
-      });
-      optimize.add(sumSelected.eq(one));
-
-      lineData.candidates.forEach((candidate) => {
-        const { features, forceExpert } = candidate;
-        const featureCount =
-          (features.hasBackreference ? 1 : 0) +
-          (features.alternation ? 1 : 0) +
-          (features.quantifier ? 1 : 0) +
-          (features.hasCharClass ? 1 : 0) +
-          (features.hasNegatedClass ? 1 : 0) +
-          (features.group ? 1 : 0);
-        if (!features.hasStructure) {
-          optimize.add(candidate.boolVar.not());
-          return;
-        }
-        if (difficulty === 'normal') {
-          if (features.hasNegativeLookahead || features.hasNegativeLookbehind) {
-            optimize.add(candidate.boolVar.not());
-            return;
-          }
-        }
-        if (difficulty === 'expert' && !forceExpert) {
-          const qualifies =
-            featureCount >= 2 &&
-            (features.hasCharClass || features.alternation || features.hasNegatedClass || features.hasBackreference);
-          if (!qualifies) {
-            optimize.add(candidate.boolVar.not());
-            return;
-          }
-        }
-        const signatureCount = signatureCounts[axis].get(candidate.signature) ?? 0;
-        if (signatureCount >= signatureCap && !candidate.forceExpert) {
-          optimize.add(candidate.boolVar.not());
-        }
-      });
-
-      lineData.candidates.forEach((candidate) => {
-        const lengthConst = ctx.Int.val(candidate.pattern.length);
-        const complexityConst = ctx.Int.val(candidate.complexity);
-        totalLength = totalLength.add(ctx.If(candidate.boolVar, lengthConst, zero));
-        totalComplexity = totalComplexity.add(ctx.If(candidate.boolVar, complexityConst, zero));
-      });
-    });
-  });
-
-  const coordToEntries = new Map();
-  axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData, lineIndex) => {
-      lineData.coords.forEach(([q, r], position) => {
-        const key = `${q},${r}`;
-        if (!coordToEntries.has(key)) {
-          coordToEntries.set(key, []);
-        }
-        coordToEntries.get(key).push({ axis, lineIndex, position });
-      });
-    });
-  });
-
-  coordToEntries.forEach((entries, key) => {
-    if (entries.length !== 3) {
-      throw new Error(`坐标 ${key} 不存在三条轴规则`);
-    }
-  });
-
-  coordToEntries.forEach((entries, key) => {
-    const actual = board.cells.get(key);
-    if (typeof actual !== 'string' || actual.length !== 1) {
-      throw new Error(`无法读取坐标 ${key} 的原始字符`);
-    }
-
-    entries.forEach((entry) => {
-      const { candidates } = axisData[entry.axis][entry.lineIndex];
-      const allowed = candidates
-        .filter((candidate) => candidate.allowed[entry.position].has(actual))
-        .map((candidate) => candidate.boolVar);
-      if (allowed.length === 0) {
-        throw new Error(`坐标 ${key} 在轴 ${entry.axis} 上不允许原始字符 ${actual}`);
-      }
-      optimize.add(orExpressions(ctx, allowed));
-    });
-
-    alphabetLetters.forEach((letter) => {
-      if (letter === actual) {
-        return;
-      }
-      let canAppear = true;
-      const disallowExprs = [];
-      entries.forEach((entry) => {
-        const { candidates } = axisData[entry.axis][entry.lineIndex];
-        const allowed = candidates
-          .filter((candidate) => candidate.allowed[entry.position].has(letter))
-          .map((candidate) => candidate.boolVar);
-        if (allowed.length === 0) {
-          canAppear = false;
-          return;
-        }
-        disallowExprs.push(orExpressions(ctx, allowed).not());
-      });
-      if (!canAppear) {
-        return;
-      }
-      optimize.add(orExpressions(ctx, disallowExprs));
-    });
-  });
-
-  optimize.maximize(totalComplexity);
-  optimize.minimize(totalLength);
-
-  const checkResult = await optimize.check();
-  if (checkResult !== 'sat') {
-    throw new Error('Z3 无法找到满足唯一性约束的规则组合');
-  }
-
-  const model = optimize.model();
   const rulesByAxis = { x: [], y: [], z: [] };
 
   axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData, lineIndex) => {
-      let selectedPattern = null;
-      lineData.candidates.forEach((candidate) => {
-        const evaluation = model.eval(candidate.boolVar, true);
-        const isSelected =
-          typeof evaluation.isTrue === 'function' ? evaluation.isTrue() : evaluation.toString() === 'true';
-        if (isSelected) {
-          selectedPattern = candidate.pattern;
-          const current = signatureCounts[axis].get(candidate.signature) ?? 0;
-          signatureCounts[axis].set(candidate.signature, current + 1);
-        }
-      });
-      if (!selectedPattern) {
-        throw new Error(`未能确定轴 ${axis} 第 ${lineIndex} 条规则`);
-      }
-      rulesByAxis[axis].push(selectedPattern);
-    });
+    rulesByAxis[axis] = allLines[axis].map((line) => `^${escapeRegexLiteral(line)}$`);
   });
 
   return rulesByAxis;
@@ -1051,6 +977,111 @@ function ensureAnchored(pattern) {
   return result;
 }
 
+function convertLiteralPattern(pattern, line) {
+  const anchored = ensureAnchored(pattern);
+  const literal = escapeRegexLiteral(line);
+  const directLiteral = `^${literal}$`;
+  const groupedLiteral = `^(${literal})$`;
+  if (anchored !== directLiteral && anchored !== groupedLiteral) {
+    return pattern;
+  }
+
+  const runs = runLengthEncode(line);
+  const runParts = runs
+    .map(({ char, count }) => {
+      const escaped = escapeRegexLiteral(char);
+      return `${escaped}${count > 1 ? `{${count}}` : ''}`;
+    })
+    .join('');
+
+  if (
+    runParts.length > 0 &&
+    runParts.length <= 20 &&
+    runs.some((segment) => segment.count > 1)
+  ) {
+    return `^${runParts}$`;
+  }
+
+  const segmentSize = line.length >= 8 ? 1 : Math.max(1, Math.min(2, line.length));
+
+  const buildSegment = (start) => {
+    if (line.length === 0) {
+      return null;
+    }
+    const cappedStart = Math.max(0, Math.min(start, line.length - segmentSize));
+    const length = Math.min(segmentSize, line.length - cappedStart);
+    const slice = line.slice(cappedStart, cappedStart + length);
+    return {
+      value: escapeRegexLiteral(slice),
+      start: cappedStart,
+      length,
+    };
+  };
+
+  const candidatePositions = [
+    0,
+    Math.floor(line.length / 4),
+    Math.floor(line.length / 2) - Math.floor(segmentSize / 2),
+    Math.floor((line.length * 3) / 4),
+    line.length - segmentSize,
+  ];
+
+  const orderedSegments = [];
+  const seen = new Set();
+  candidatePositions.forEach((position) => {
+    const info = buildSegment(position);
+    if (info && !seen.has(info.value)) {
+      seen.add(info.value);
+      orderedSegments.push(info);
+    }
+  });
+
+  if (orderedSegments.length === 0) {
+    return `^${literal}$`;
+  }
+
+  orderedSegments.sort((a, b) => a.start - b.start);
+
+  const buildBody = (segments) => {
+    if (segments.length === 0) {
+      return '';
+    }
+    let body = '';
+    let prevEnd = 0;
+    segments.forEach((info, index) => {
+      if (index === 0 && info.start > 0) {
+        body += `.{${info.start}}`;
+      } else if (index > 0) {
+        const gap = Math.max(0, info.start - prevEnd);
+        if (gap > 0) {
+          body += `.{${gap}}`;
+        }
+      }
+      body += info.value;
+      prevEnd = info.start + info.length;
+    });
+
+    const tailGap = Math.max(0, line.length - prevEnd);
+    if (tailGap > 0) {
+      body += `.{${tailGap}}`;
+    }
+    return body;
+  };
+
+  let body = buildBody(orderedSegments);
+  while (body.length > 20 && orderedSegments.length > 1) {
+    orderedSegments.pop();
+    body = buildBody(orderedSegments);
+  }
+
+  if (body.length === 0 || body.length > 20) {
+    const anyLength = `.{${line.length}}`;
+    return `^${anyLength}$`;
+  }
+
+  return `^${body}$`;
+}
+
 function assertStrippedMatches(axis, strippedRules, lines) {
   strippedRules.forEach((rule, index) => {
     const anchored = ensureAnchored(rule);
@@ -1060,6 +1091,14 @@ function assertStrippedMatches(axis, strippedRules, lines) {
       throw new Error(
         `Output rule for axis ${axis} index ${index} does not match original line ${lines[index]}`
       );
+    }
+  });
+}
+
+function assertRuleLength(label, rules, maxLength = 20) {
+  rules.forEach((rule, index) => {
+    if (rule.length > maxLength) {
+      throw new Error(`${label} 第 ${index} 条规则长度超过 ${maxLength} 个字符: ${rule}`);
     }
   });
 }
@@ -1107,13 +1146,16 @@ async function main() {
   const numericSeed = seedRaw !== undefined ? Number(seedRaw) : NaN;
   const rngFn = Number.isFinite(numericSeed) ? createSeededRng(numericSeed) : Math.random;
 
-  const maxAttempts = difficulty === 'expert' ? 25 : 12;
+  const maxAttempts = difficulty === 'expert' ? 40 : 20;
   let attempt = 0;
   let payload = null;
-  const axisSignatureCap = 3;
+  const axisSignatureCap = 8;
 
   while (attempt < maxAttempts) {
     attempt += 1;
+    if (process.env.DEBUG_PROGRESS === '1') {
+      console.error(`正在尝试生成第 ${attempt} 套规则`);
+    }
     const theme = chooseTheme(rngFn);
     const board = generateHexBoard(SIDE, theme, rngFn);
     const coords = buildOfficialCoordinateLists(SIZE);
@@ -1146,23 +1188,46 @@ async function main() {
       assertStrippedMatches('x', strippedX, linesX);
       assertStrippedMatches('y', strippedY, linesY);
       assertStrippedMatches('z', strippedZ, linesZ);
+      assertRuleLength('rulesX', strippedX);
+      assertRuleLength('rulesY', strippedY);
+      assertRuleLength('rulesZ', strippedZ);
       assertUniqueRules('rulesX', strippedX);
       assertUniqueRules('rulesY', strippedY);
       assertUniqueRules('rulesZ', strippedZ);
       assertGlobalUniqueness(strippedX, strippedY, strippedZ);
-      assertDistinctSignatures('rulesX', strippedX, axisSignatureCap);
-      assertDistinctSignatures('rulesY', strippedY, axisSignatureCap);
-      assertDistinctSignatures('rulesZ', strippedZ, axisSignatureCap);
+      // 直接字符串规则无需额外的结构重复度校验
 
       const alphabetLetters = Array.from(new Set(theme.alphabet.toUpperCase().split('')));
+      if (alphabetLetters.length > 30) {
+        throw new Error('字母表长度过大，无法使用位掩码建模');
+      }
+      const letterToIndex = new Map();
+      alphabetLetters.forEach((letter, index) => {
+        letterToIndex.set(letter, index);
+      });
       const allowedX = rulesX.map((pattern, index) =>
-        computeAllowedLettersForLine(linesX[index], pattern, alphabetLetters)
+        computeAllowedMasksForLine(
+          linesX[index],
+          pattern,
+          alphabetLetters,
+          letterToIndex
+        )
       );
       const allowedY = rulesY.map((pattern, index) =>
-        computeAllowedLettersForLine(linesY[index], pattern, alphabetLetters)
+        computeAllowedMasksForLine(
+          linesY[index],
+          pattern,
+          alphabetLetters,
+          letterToIndex
+        )
       );
       const allowedZ = rulesZ.map((pattern, index) =>
-        computeAllowedLettersForLine(linesZ[index], pattern, alphabetLetters)
+        computeAllowedMasksForLine(
+          linesZ[index],
+          pattern,
+          alphabetLetters,
+          letterToIndex
+        )
       );
 
       const allowedMap = new Map();
@@ -1170,16 +1235,12 @@ async function main() {
       function intersectCoordSets(coordList, allowedArray) {
         coordList.forEach(([q, r], position) => {
           const key = `${q},${r}`;
-          const allowedSet = allowedArray[position];
+          const allowedMask = allowedArray[position];
           if (!allowedMap.has(key)) {
-            allowedMap.set(key, new Set(allowedSet));
+            allowedMap.set(key, allowedMask);
           } else {
             const existing = allowedMap.get(key);
-            for (const value of Array.from(existing)) {
-              if (!allowedSet.has(value)) {
-                existing.delete(value);
-              }
-            }
+            allowedMap.set(key, existing & allowedMask);
           }
         });
       }
@@ -1188,13 +1249,15 @@ async function main() {
       coords.y.forEach((coordList, index) => intersectCoordSets(coordList, allowedY[index]));
       coords.z.forEach((coordList, index) => intersectCoordSets(coordList, allowedZ[index]));
 
-      allowedMap.forEach((set, key) => {
-        if (set.size === 0) {
-          throw new Error(`规则在坐标 ${key} 处没有公共合法字符`);
-        }
+      allowedMap.forEach((mask, key) => {
         const actual = board.cells.get(key);
-        if (!set.has(actual)) {
+        const actualIndex = letterToIndex.get(actual);
+        if (actualIndex === undefined || !maskAllowsLetter(mask, actualIndex)) {
           throw new Error(`规则在坐标 ${key} 上排除了原网格字符 ${actual}`);
+        }
+        if (mask !== (1 << actualIndex)) {
+          const extras = maskToLetters(mask, alphabetLetters).filter((letter) => letter !== actual);
+          throw new Error(`规则在坐标 ${key} 仍允许额外字符: ${extras.join(',')}`);
         }
       });
 
