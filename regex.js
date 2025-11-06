@@ -398,6 +398,16 @@ function computeAllowedMasksForLine(line, pattern, alphabet, letterToIndex) {
   return result;
 }
 
+function bitCount(mask) {
+  let count = 0;
+  let value = mask >>> 0;
+  while (value) {
+    value &= value - 1;
+    count += 1;
+  }
+  return count;
+}
+
 function maskAllowsLetter(mask, letterIndex) {
   return (mask & (1 << letterIndex)) !== 0;
 }
@@ -843,15 +853,7 @@ function generateCandidates(line, difficulty, theme) {
 }
 
 
-function orExpressions(ctx, exprs) {
-  if (exprs.length === 0) {
-    return ctx.Bool.val(false);
-  }
-  if (exprs.length === 1) {
-    return exprs[0];
-  }
-  return ctx.Or(...exprs);
-}
+
 
 async function buildAllRules(allLines, coords, difficulty, ctx, theme, signatureCap, board) {
   const alphabetLetters = Array.from(new Set(theme.alphabet.toUpperCase().split('')));
@@ -866,7 +868,6 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
   alphabetLetters.forEach((letter, index) => {
     letterToIndex.set(letter, index);
   });
-  const indexToLetter = alphabetLetters.slice();
 
   const axisNames = ['x', 'y', 'z'];
   const axisData = {};
@@ -877,38 +878,46 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
       if (candidates.length === 0) {
         throw new Error(`No regex candidates available for ${axis}_${lineIndex}`);
       }
-      const rawInfos = candidates.map((candidate, candidateIndex) => {
-        const boolVar = ctx.Bool.const(`${axis}_${lineIndex}_cand_${candidateIndex}`);
-        const allowedMasks = computeAllowedMasksForLine(
-          line,
-          candidate.pattern,
-          alphabetLetters,
-          letterToIndex
-        );
-        if (
-          !allowedMasks.every((mask, pos) =>
-            maskAllowsLetter(mask, letterToIndex.get(line[pos]))
-          )
-        ) {
-          throw new Error(`Candidate ${candidate.pattern} 排除了原始字符 (axis=${axis}, index=${lineIndex})`);
-        }
-        return {
-          pattern: candidate.pattern,
-          features: candidate.features,
-          forceExpert: candidate.forceExpert,
-          complexity: typeof candidate.complexity === 'number'
-            ? candidate.complexity
-            : complexityScore(candidate.features),
-          signature: patternSignature(stripAnchors(candidate.pattern)),
-          boolVar,
-          allowedMasks,
-        };
-      });
+      const rawInfos = candidates
+        .map((candidate) => {
+          const allowedMasks = computeAllowedMasksForLine(
+            line,
+            candidate.pattern,
+            alphabetLetters,
+            letterToIndex
+          );
+          if (
+            !allowedMasks.every((mask, pos) =>
+              maskAllowsLetter(mask, letterToIndex.get(line[pos]))
+            )
+          ) {
+            throw new Error(`Candidate ${candidate.pattern} 排除了原始字符 (axis=${axis}, index=${lineIndex})`);
+          }
+          const restrictive = allowedMasks.some((mask) => bitCount(mask) <= 2);
+          if (!restrictive && !candidate.forceExpert) {
+            return null;
+          }
+          return {
+            pattern: candidate.pattern,
+            features: candidate.features,
+            forceExpert: candidate.forceExpert,
+            complexity: typeof candidate.complexity === 'number'
+              ? candidate.complexity
+              : complexityScore(candidate.features),
+            signature: patternSignature(stripAnchors(candidate.pattern)),
+            allowedMasks,
+          };
+        })
+        .filter(Boolean);
+
+      if (rawInfos.length === 0) {
+        throw new Error(`轴 ${axis} 第 ${lineIndex} 行没有可用候选`);
+      }
 
       const fallbackSet = new Set(
         rawInfos.filter((info) => info.forceExpert).map((info) => info.pattern)
       );
-      const limit = difficulty === 'expert' ? 6 : 5;
+      const limit = difficulty === 'expert' ? 4 : 3;
       const sorted = rawInfos
         .filter((info) => !info.forceExpert)
         .sort((a, b) => {
@@ -921,253 +930,144 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
           return a.pattern.localeCompare(b.pattern);
         })
         .slice(0, limit);
-
-      const candidateInfos = [...sorted];
-      rawInfos.forEach((info) => {
-        if (fallbackSet.has(info.pattern) && !candidateInfos.some((item) => item.pattern === info.pattern)) {
-          candidateInfos.push(info);
-        }
-      });
-
-      return {
-        line,
-        coords: coords[axis][lineIndex],
-        candidates: candidateInfos,
-      };
+      const selectedPatterns = new Set([...fallbackSet, ...sorted.map((info) => info.pattern)]);
+      const filtered = rawInfos.filter((info) => selectedPatterns.has(info.pattern));
+      return { line, candidates: filtered };
     });
   });
 
-  const coordinateEntries = new Map();
-
+  const coordinateToAxes = new Map();
   axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData) => {
-      lineData.coords.forEach(([q, r], position) => {
+    coords[axis].forEach((coordList, lineIndex) => {
+      coordList.forEach(([q, r]) => {
         const key = `${q},${r}`;
-        let entry = coordinateEntries.get(key);
-        if (!entry) {
-          const actual = board.cells.get(key);
-          if (!actual) {
-            throw new Error(`Board missing character at ${key}`);
-          }
-          const actualIndex = letterToIndex.get(actual);
-          if (actualIndex === undefined) {
-            throw new Error(`原网格字符 ${actual} 不在主题字母表内`);
-          }
-          entry = {
-            actual,
-            actualIndex,
-            axes: {
-              x: new Map(),
-              y: new Map(),
-              z: new Map(),
-            },
-          };
-          coordinateEntries.set(key, entry);
+        if (!coordinateToAxes.has(key)) {
+          coordinateToAxes.set(key, []);
         }
+        coordinateToAxes.get(key).push({ axis, lineIndex });
+      });
+    });
+  });
 
-        const axisMap = entry.axes[axis];
-        lineData.candidates.forEach((candidate) => {
-          const allowedMask = candidate.allowedMasks[position];
-          const lettersForMask = maskToLetters(allowedMask, indexToLetter);
-          lettersForMask.forEach((letter) => {
-            let bucket = axisMap.get(letter);
-            if (!bucket) {
-              bucket = [];
-              axisMap.set(letter, bucket);
+  const selection = { x: [], y: [], z: [] };
+  axisNames.forEach((axis) => {
+    selection[axis] = axisData[axis].map(() => 0);
+  });
+
+  function selectionKey(sel) {
+    return axisNames.map((axis) => sel[axis].join(',')).join('|');
+  }
+
+  function evaluate(sel) {
+    const allowedMap = new Map();
+    const signatureCounts = { x: new Map(), y: new Map(), z: new Map() };
+    let invalid = false;
+
+    axisNames.forEach((axis) => {
+      sel[axis].forEach((candidateIndex, lineIndex) => {
+        const candidate = axisData[axis][lineIndex].candidates[candidateIndex];
+        const coordList = coords[axis][lineIndex];
+        const currentCount = signatureCounts[axis].get(candidate.signature) ?? 0;
+        signatureCounts[axis].set(candidate.signature, currentCount + 1);
+        coordList.forEach(([q, r], position) => {
+          const key = `${q},${r}`;
+          const mask = candidate.allowedMasks[position];
+          if (!allowedMap.has(key)) {
+            allowedMap.set(key, mask);
+          } else {
+            const combined = allowedMap.get(key) & mask;
+            allowedMap.set(key, combined);
+            if (combined === 0) {
+              invalid = true;
             }
-            bucket.push(candidate.boolVar);
-          });
+          }
         });
       });
     });
-  });
 
-  let minTotalLength = 0;
-  let maxTotalLength = 0;
-  let maxTotalComplexity = 0;
-
-  axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData) => {
-      let lineMinLength = Infinity;
-      let lineMaxLength = 0;
-      let lineMaxComplexity = 0;
-      lineData.candidates.forEach((candidate) => {
-        lineMinLength = Math.min(lineMinLength, candidate.pattern.length);
-        lineMaxLength = Math.max(lineMaxLength, candidate.pattern.length);
-        lineMaxComplexity = Math.max(lineMaxComplexity, candidate.complexity);
-      });
-      minTotalLength += lineMinLength;
-      maxTotalLength += lineMaxLength;
-      maxTotalComplexity += lineMaxComplexity;
-    });
-  });
-
-  const solver = new ctx.Solver();
-  const zero = ctx.Int.val(0);
-  const one = ctx.Int.val(1);
-  const maxIndexConst = ctx.Int.val(alphabetLetters.length - 1);
-  const letterIndexConsts = alphabetLetters.map((_, index) => ctx.Int.val(index));
-  coordinateEntries.forEach((entry, key) => {
-    const cellVar = ctx.Int.const(`cell_${key.replace(',', '_')}`);
-    entry.var = cellVar;
-    solver.add(cellVar.ge(zero));
-    solver.add(cellVar.le(maxIndexConst));
-  });
-  let totalLength = ctx.Int.val(0);
-  let totalComplexity = ctx.Int.val(0);
-
-  const signatureCounts = { x: new Map(), y: new Map(), z: new Map() };
-
-  axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData, lineIndex) => {
-      const selectVars = lineData.candidates.map((candidate) => candidate.boolVar);
-      let sumSelected = ctx.Int.val(0);
-      selectVars.forEach((boolVar) => {
-        sumSelected = sumSelected.add(ctx.If(boolVar, one, zero));
-      });
-      solver.add(sumSelected.eq(one));
-
-      lineData.candidates.forEach((candidate) => {
-        const { features, forceExpert } = candidate;
-        const featureCount =
-          (features.hasBackreference ? 1 : 0) +
-          (features.alternation ? 1 : 0) +
-          (features.quantifier ? 1 : 0) +
-          (features.hasCharClass ? 1 : 0) +
-          (features.hasNegatedClass ? 1 : 0) +
-          (features.group ? 1 : 0);
-        if (!features.hasStructure) {
-          solver.add(candidate.boolVar.not());
-          return;
-        }
-        if (difficulty === 'normal') {
-          if (features.hasNegativeLookahead || features.hasNegativeLookbehind) {
-            solver.add(candidate.boolVar.not());
-            return;
-          }
-        }
-        if (difficulty === 'expert' && !forceExpert) {
-          const qualifies =
-            featureCount >= 2 &&
-            (features.hasCharClass || features.alternation || features.hasNegatedClass || features.hasBackreference);
-          if (!qualifies) {
-            solver.add(candidate.boolVar.not());
-            return;
-          }
-        }
-        const signatureCount = signatureCounts[axis].get(candidate.signature) ?? 0;
-        if (signatureCount >= signatureCap && !candidate.forceExpert) {
-          solver.add(candidate.boolVar.not());
-        }
-      });
-
-      lineData.candidates.forEach((candidate) => {
-        const lengthConst = ctx.Int.val(candidate.pattern.length);
-        const complexityConst = ctx.Int.val(candidate.complexity);
-        totalLength = totalLength.add(ctx.If(candidate.boolVar, lengthConst, zero));
-        totalComplexity = totalComplexity.add(ctx.If(candidate.boolVar, complexityConst, zero));
-      });
-    });
-  });
-
-  coordinateEntries.forEach((entry, key) => {
-    const cellVar = entry.var;
-    const actualConst = letterIndexConsts[entry.actualIndex];
-
-    const actualBucketsX = entry.axes.x.get(entry.actual) ?? [];
-    const actualBucketsY = entry.axes.y.get(entry.actual) ?? [];
-    const actualBucketsZ = entry.axes.z.get(entry.actual) ?? [];
-    if (actualBucketsX.length === 0) {
-      throw new Error(`坐标 ${key} 在 x 轴上没有候选允许原始字符 ${entry.actual}`);
+    if (invalid) {
+      return { invalid: true };
     }
-    if (actualBucketsY.length === 0) {
-      throw new Error(`坐标 ${key} 在 y 轴上没有候选允许原始字符 ${entry.actual}`);
-    }
-    if (actualBucketsZ.length === 0) {
-      throw new Error(`坐标 ${key} 在 z 轴上没有候选允许原始字符 ${entry.actual}`);
-    }
-    const allowActualX = orExpressions(ctx, actualBucketsX);
-    const allowActualY = orExpressions(ctx, actualBucketsY);
-    const allowActualZ = orExpressions(ctx, actualBucketsZ);
-    const allowActual = ctx.And(allowActualX, allowActualY, allowActualZ);
-    solver.add(allowActual);
-    solver.add(ctx.Implies(allowActual, cellVar.eq(actualConst)));
 
-    const lettersToCheck = new Set();
-    entry.axes.x.forEach((_, letter) => lettersToCheck.add(letter));
-    entry.axes.y.forEach((_, letter) => lettersToCheck.add(letter));
-    entry.axes.z.forEach((_, letter) => lettersToCheck.add(letter));
-    lettersToCheck.delete(entry.actual);
-
-    lettersToCheck.forEach((letter) => {
-      const allowX = orExpressions(ctx, entry.axes.x.get(letter) ?? []);
-      const allowY = orExpressions(ctx, entry.axes.y.get(letter) ?? []);
-      const allowZ = orExpressions(ctx, entry.axes.z.get(letter) ?? []);
-      const letterAllowed = ctx.And(allowX, allowY, allowZ);
-      solver.add(letterAllowed.not());
+    const extras = [];
+    allowedMap.forEach((mask, key) => {
+      const actual = board.cells.get(key);
+      const actualIndex = letterToIndex.get(actual);
+      if (actualIndex === undefined) {
+        throw new Error(`坐标 ${key} 的字符 ${actual} 不在字母表中`);
+      }
+      if (!maskAllowsLetter(mask, actualIndex)) {
+        throw new Error(`规则在坐标 ${key} 排除了原网格字符 ${actual}`);
+      }
+      if (mask !== (1 << actualIndex)) {
+        extras.push({ key, mask });
+      }
     });
-  });
 
-  const checkResult = await solver.check();
-  if (checkResult !== 'sat') {
-    throw new Error('Z3 无法找到满足唯一性约束的规则组合');
+    return { allowedMap, extras, signatureCounts };
   }
 
-  const model = solver.model();
-  const cellAssignments = [];
-  coordinateEntries.forEach((entry) => {
-    const value = model.eval(entry.var, true);
-    const parsed = Number(value.toString());
-    if (!Number.isFinite(parsed)) {
-      throw new Error('无法解析格子取值');
-    }
-    cellAssignments.push({ entry, value: parsed });
-    if (parsed !== entry.actualIndex) {
-      throw new Error('求解器给出的解与原网格不一致');
-    }
-  });
-  solver.push();
-  const differenceClauses = cellAssignments.map(({ entry, value }) =>
-    entry.var.neq(letterIndexConsts[value])
-  );
-  solver.add(orExpressions(ctx, differenceClauses));
-  const uniquenessCheck = await solver.check();
-  solver.pop();
-  if (uniquenessCheck === 'sat') {
-    throw new Error('规则组合不是唯一解');
+  function exceedsSignatureCap(signatureCounts) {
+    return axisNames.some((axis) =>
+      Array.from(signatureCounts[axis].values()).some((count) => count > signatureCap)
+    );
   }
-  const bestAssignment = new Map();
-  axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData) => {
-      lineData.candidates.forEach((candidate) => {
-        const evaluation = model.eval(candidate.boolVar, true);
-        const isSelected =
-          typeof evaluation.isTrue === 'function'
-            ? evaluation.isTrue()
-            : evaluation.toString() === 'true';
-        bestAssignment.set(candidate.boolVar.toString(), isSelected);
-      });
-    });
-  });
+
+  const visited = new Set();
+
+  function search(sel, depth = 0) {
+    const key = selectionKey(sel);
+    if (visited.has(key)) {
+      return null;
+    }
+    visited.add(key);
+
+    const evaluation = evaluate(sel);
+    if (evaluation.invalid) {
+      return null;
+    }
+    if (exceedsSignatureCap(evaluation.signatureCounts)) {
+      return null;
+    }
+    if (evaluation.extras.length === 0) {
+      return sel;
+    }
+
+    const sortedExtras = evaluation.extras
+      .slice()
+      .sort((a, b) => bitCount(a.mask) - bitCount(b.mask));
+    const target = sortedExtras[0];
+    const axes = coordinateToAxes.get(target.key) ?? [];
+
+    for (const { axis, lineIndex } of axes) {
+      const candidates = axisData[axis][lineIndex].candidates;
+      const currentIndex = sel[axis][lineIndex];
+      for (let idx = 0; idx < candidates.length; idx += 1) {
+        if (idx === currentIndex) {
+          continue;
+        }
+        sel[axis][lineIndex] = idx;
+        const result = search(sel, depth + 1);
+        if (result) {
+          return result;
+        }
+      }
+      sel[axis][lineIndex] = currentIndex;
+    }
+
+    return null;
+  }
+
+  const resultSelection = search(selection);
+  if (!resultSelection) {
+    throw new Error('无法找到满足唯一性约束的规则组合');
+  }
 
   const rulesByAxis = { x: [], y: [], z: [] };
-
   axisNames.forEach((axis) => {
-    axisData[axis].forEach((lineData, lineIndex) => {
-      let selectedPattern = null;
-      lineData.candidates.forEach((candidate) => {
-        const key = candidate.boolVar.toString();
-        const isSelected = bestAssignment.get(key) === true;
-        if (isSelected) {
-          selectedPattern = candidate.pattern;
-          const current = signatureCounts[axis].get(candidate.signature) ?? 0;
-          signatureCounts[axis].set(candidate.signature, current + 1);
-        }
-      });
-      if (!selectedPattern) {
-        throw new Error(`未能确定轴 ${axis} 第 ${lineIndex} 条规则`);
-      }
-      rulesByAxis[axis].push(selectedPattern);
+    resultSelection[axis].forEach((candidateIndex, lineIndex) => {
+      const candidate = axisData[axis][lineIndex].candidates[candidateIndex];
+      rulesByAxis[axis].push(candidate.pattern);
     });
   });
 
