@@ -1067,7 +1067,9 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
   axisNames.forEach((axis) => {
     resultSelection[axis].forEach((candidateIndex, lineIndex) => {
       const candidate = axisData[axis][lineIndex].candidates[candidateIndex];
-      rulesByAxis[axis].push(candidate.pattern);
+      const line = axisData[axis][lineIndex].line;
+      const adjusted = convertLiteralPattern(candidate.pattern, line);
+      rulesByAxis[axis].push(adjusted);
     });
   });
 
@@ -1106,6 +1108,23 @@ function ensureAnchored(pattern) {
     result = `${result}$`;
   }
   return result;
+}
+
+function convertLiteralPattern(pattern, line) {
+  const anchored = ensureAnchored(pattern);
+  const literal = escapeRegexLiteral(line);
+  const directLiteral = `^${literal}$`;
+  const groupedLiteral = `^(${literal})$`;
+  if (anchored !== directLiteral && anchored !== groupedLiteral) {
+    return pattern;
+  }
+  const segments = runLengthEncode(line);
+  const parts = segments.map(({ char, count }) => {
+    const escaped = escapeForCharClassChar(char);
+    const quantifier = count > 1 ? `{${count}}` : '';
+    return `([${escaped}]${quantifier})`;
+  });
+  return `^${parts.join('')}$`;
 }
 
 function assertStrippedMatches(axis, strippedRules, lines) {
