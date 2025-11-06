@@ -949,8 +949,13 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
           if (!actual) {
             throw new Error(`Board missing character at ${key}`);
           }
+          const actualIndex = letterToIndex.get(actual);
+          if (actualIndex === undefined) {
+            throw new Error(`原网格字符 ${actual} 不在主题字母表内`);
+          }
           entry = {
             actual,
+            actualIndex,
             axes: {
               x: new Map(),
               y: new Map(),
@@ -1000,6 +1005,14 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
   const solver = new ctx.Solver();
   const zero = ctx.Int.val(0);
   const one = ctx.Int.val(1);
+  const maxIndexConst = ctx.Int.val(alphabetLetters.length - 1);
+  const letterIndexConsts = alphabetLetters.map((_, index) => ctx.Int.val(index));
+  coordinateEntries.forEach((entry, key) => {
+    const cellVar = ctx.Int.const(`cell_${key.replace(',', '_')}`);
+    entry.var = cellVar;
+    solver.add(cellVar.ge(zero));
+    solver.add(cellVar.le(maxIndexConst));
+  });
   let totalLength = ctx.Int.val(0);
   let totalComplexity = ctx.Int.val(0);
 
@@ -1058,13 +1071,27 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
   });
 
   coordinateEntries.forEach((entry, key) => {
-    ['x', 'y', 'z'].forEach((axis) => {
-      const actualBuckets = entry.axes[axis].get(entry.actual) ?? [];
-      if (actualBuckets.length === 0) {
-        throw new Error(`坐标 ${key} 在轴 ${axis} 上不允许原始字符 ${entry.actual}`);
-      }
-      solver.add(orExpressions(ctx, actualBuckets));
-    });
+    const cellVar = entry.var;
+    const actualConst = letterIndexConsts[entry.actualIndex];
+
+    const actualBucketsX = entry.axes.x.get(entry.actual) ?? [];
+    const actualBucketsY = entry.axes.y.get(entry.actual) ?? [];
+    const actualBucketsZ = entry.axes.z.get(entry.actual) ?? [];
+    if (actualBucketsX.length === 0) {
+      throw new Error(`坐标 ${key} 在 x 轴上没有候选允许原始字符 ${entry.actual}`);
+    }
+    if (actualBucketsY.length === 0) {
+      throw new Error(`坐标 ${key} 在 y 轴上没有候选允许原始字符 ${entry.actual}`);
+    }
+    if (actualBucketsZ.length === 0) {
+      throw new Error(`坐标 ${key} 在 z 轴上没有候选允许原始字符 ${entry.actual}`);
+    }
+    const allowActualX = orExpressions(ctx, actualBucketsX);
+    const allowActualY = orExpressions(ctx, actualBucketsY);
+    const allowActualZ = orExpressions(ctx, actualBucketsZ);
+    const allowActual = ctx.And(allowActualX, allowActualY, allowActualZ);
+    solver.add(allowActual);
+    solver.add(ctx.Implies(allowActual, cellVar.eq(actualConst)));
 
     const lettersToCheck = new Set();
     entry.axes.x.forEach((_, letter) => lettersToCheck.add(letter));
@@ -1076,7 +1103,8 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
       const allowX = orExpressions(ctx, entry.axes.x.get(letter) ?? []);
       const allowY = orExpressions(ctx, entry.axes.y.get(letter) ?? []);
       const allowZ = orExpressions(ctx, entry.axes.z.get(letter) ?? []);
-      solver.add(ctx.Or(allowX.not(), allowY.not(), allowZ.not()));
+      const letterAllowed = ctx.And(allowX, allowY, allowZ);
+      solver.add(letterAllowed.not());
     });
   });
 
@@ -1086,6 +1114,28 @@ async function buildAllRules(allLines, coords, difficulty, ctx, theme, signature
   }
 
   const model = solver.model();
+  const cellAssignments = [];
+  coordinateEntries.forEach((entry) => {
+    const value = model.eval(entry.var, true);
+    const parsed = Number(value.toString());
+    if (!Number.isFinite(parsed)) {
+      throw new Error('无法解析格子取值');
+    }
+    cellAssignments.push({ entry, value: parsed });
+    if (parsed !== entry.actualIndex) {
+      throw new Error('求解器给出的解与原网格不一致');
+    }
+  });
+  solver.push();
+  const differenceClauses = cellAssignments.map(({ entry, value }) =>
+    entry.var.neq(letterIndexConsts[value])
+  );
+  solver.add(orExpressions(ctx, differenceClauses));
+  const uniquenessCheck = await solver.check();
+  solver.pop();
+  if (uniquenessCheck === 'sat') {
+    throw new Error('规则组合不是唯一解');
+  }
   const bestAssignment = new Map();
   axisNames.forEach((axis) => {
     axisData[axis].forEach((lineData) => {
